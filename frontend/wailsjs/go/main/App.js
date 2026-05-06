@@ -10,12 +10,20 @@ export function CleanString(arg1) {
   return window['go']['main']['App']['CleanString'](arg1);
 }
 
+export function ClearAICache() {
+  return window['go']['main']['App']['ClearAICache']();
+}
+
 export function DeepseekEnhanceMatching(arg1, arg2) {
   return window['go']['main']['App']['DeepseekEnhanceMatching'](arg1, arg2);
 }
 
 export function ExportResults(arg1) {
   return window['go']['main']['App']['ExportResults'](arg1);
+}
+
+export function GetAICacheInfo() {
+  return window['go']['main']['App']['GetAICacheInfo']();
 }
 
 export function GetDeepseekStatus() {

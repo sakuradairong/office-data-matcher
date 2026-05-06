@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -116,21 +119,135 @@ type deepseekResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// ---------- AI 缓存 ----------
+
+// AICacheEntry 单条缓存记录
+type AICacheEntry struct {
+	PromptHash string `json:"promptHash"`
+	Response   string `json:"response"`
+	CreatedAt  int64  `json:"createdAt"`
+}
+
+// AICache AI 响应缓存（持久化到临时文件）
+type AICache struct {
+	Entries  []AICacheEntry `json:"entries"`
+	mu       sync.RWMutex
+	filePath string
+	maxSize  int // 最大缓存条目数
+}
+
+// cacheFileName 缓存文件名
+const cacheFileName = "data-matcher-ai-cache.json"
+
+// newAICache 创建缓存实例并加载已有数据
+func newAICache() *AICache {
+	c := &AICache{
+		filePath: filepath.Join(os.TempDir(), cacheFileName),
+		maxSize:  500,
+	}
+	c.loadFromFile()
+	return c
+}
+
+// loadFromFile 从磁盘加载缓存
+func (c *AICache) loadFromFile() {
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return // 文件不存在或无法读取，从空缓存开始
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = json.Unmarshal(data, c) // 忽略解析错误，重置为 entries
+}
+
+// saveToFile 将缓存写入磁盘
+func (c *AICache) saveToFile() {
+	c.mu.RLock()
+	data, err := json.Marshal(c)
+	c.mu.RUnlock()
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(c.filePath, data, 0644)
+}
+
+// get 根据 hash 查找缓存，命中返回响应，否则返回空
+func (c *AICache) get(hash string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for i := range c.Entries {
+		if c.Entries[i].PromptHash == hash {
+			return c.Entries[i].Response, true
+		}
+	}
+	return "", false
+}
+
+// put 存入一条缓存（线程安全 + 自动裁剪）
+func (c *AICache) put(hash, response string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 去重：如果已存在则覆盖
+	for i := range c.Entries {
+		if c.Entries[i].PromptHash == hash {
+			c.Entries[i].Response = response
+			c.Entries[i].CreatedAt = time.Now().Unix()
+			return
+		}
+	}
+
+	c.Entries = append(c.Entries, AICacheEntry{
+		PromptHash: hash,
+		Response:   response,
+		CreatedAt:  time.Now().Unix(),
+	})
+
+	// 超过上限则删除最旧的条目
+	if len(c.Entries) > c.maxSize {
+		// 按 CreatedAt 排序保留最新的
+		sort.Slice(c.Entries, func(i, j int) bool {
+			return c.Entries[i].CreatedAt > c.Entries[j].CreatedAt
+		})
+		c.Entries = c.Entries[:c.maxSize]
+	}
+}
+
+// clear 清空所有缓存
+func (c *AICache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Entries = nil
+	_ = os.Remove(c.filePath)
+}
+
+// stat 返回缓存统计
+func (c *AICache) stat() (count int, path string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.Entries), c.filePath
+}
+
 // ---------- App 结构体 ----------
 
 type App struct {
 	ctx          context.Context
 	deepseekKey  string
+	aiCache      *AICache
 }
 
 // NewApp 创建 App 实例
 func NewApp() *App {
-	return &App{}
+	return &App{
+		aiCache: newAICache(),
+	}
 }
 
 // startup 保存上下文
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	count, path := a.aiCache.stat()
+	fmt.Printf("[CACHE] AI 缓存已加载，当前 %d 条缓存记录 (文件: %s)\n", count, path)
 }
 
 // emitProgress 向前端发送进度事件
@@ -158,6 +275,22 @@ func (a *App) SetDeepseekAPIKey(key string) string {
 // GetDeepseekStatus 返回是否已配置 Deepseek API 密钥
 func (a *App) GetDeepseekStatus() bool {
 	return a.deepseekKey != ""
+}
+
+// ClearAICache 清除所有 AI 缓存
+func (a *App) ClearAICache() string {
+	before, _ := a.aiCache.stat()
+	a.aiCache.clear()
+	return fmt.Sprintf("已清除 %d 条 AI 缓存记录", before)
+}
+
+// GetAICacheInfo 返回 AI 缓存信息（条目数、文件路径）
+func (a *App) GetAICacheInfo() map[string]interface{} {
+	count, path := a.aiCache.stat()
+	return map[string]interface{}{
+		"count":    count,
+		"filePath": path,
+	}
 }
 
 // ---------- 文件选择对话框 ----------
@@ -810,11 +943,32 @@ type rowAndScore struct {
 
 // ---------- Deepseek AI 增强匹配 ----------
 
-// callDeepseekAPI 调用 Deepseek Chat API
+// hashPrompt 对 prompt 消息计算 SHA256（用于缓存键）
+func hashPrompt(messages []deepseekMessage) string {
+	h := sha256.New()
+	for _, m := range messages {
+		h.Write([]byte(m.Role))
+		h.Write([]byte{0})
+		h.Write([]byte(m.Content))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// callDeepseekAPI 调用 Deepseek Chat API（带缓存）
 func (a *App) callDeepseekAPI(messages []deepseekMessage) (string, error) {
 	if a.deepseekKey == "" {
 		return "", fmt.Errorf("请先设置 Deepseek API 密钥")
 	}
+
+	hash := hashPrompt(messages)
+
+	// 先查缓存
+	if cached, ok := a.aiCache.get(hash); ok {
+		fmt.Printf("[CACHE] ✓ 命中 AI 缓存 (hash=%s)\n", hash[:12])
+		return cached, nil
+	}
+	fmt.Printf("[CACHE] ✗ 缓存未命中 (hash=%s)，调用 API...\n", hash[:12])
 
 	reqBody := deepseekRequest{
 		Model:       "deepseek-chat",
@@ -853,16 +1007,64 @@ func (a *App) callDeepseekAPI(messages []deepseekMessage) (string, error) {
 		return "", fmt.Errorf("Deepseek 未返回有效结果")
 	}
 
-	return strings.TrimSpace(dr.Choices[0].Message.Content), nil
+	result := strings.TrimSpace(dr.Choices[0].Message.Content)
+
+	// 写入缓存并持久化
+	a.aiCache.put(hash, result)
+	a.aiCache.saveToFile()
+
+	return result, nil
 }
 
-// buildAIPrompt 构建 AI 匹配提示词
+// buildAIPrompt 构建 AI 匹配提示词（仅传入时间窗口内的日报记录以减少 token）
 func buildAIPrompt(monthlyRecords []MonthlyRecord, dailyRecords []DailyRecord, batchStart, batchSize int) []deepseekMessage {
 	end := batchStart + batchSize
 	if end > len(monthlyRecords) {
 		end = len(monthlyRecords)
 	}
 	batch := monthlyRecords[batchStart:end]
+
+	// 计算本批月报的时间范围
+	var minTime, maxTime time.Time
+	hasTime := false
+	for _, mr := range batch {
+		if !hasTime {
+			minTime = mr.OccurTime
+			maxTime = mr.OccurTime
+			hasTime = true
+		} else {
+			if mr.OccurTime.Before(minTime) {
+				minTime = mr.OccurTime
+			}
+			if mr.OccurTime.After(maxTime) {
+				maxTime = mr.OccurTime
+			}
+		}
+	}
+
+	// 时间窗口前后各扩展 3 小时，确保覆盖 AI 匹配所需的 ±2h
+	twoHours := 3 * time.Hour
+	windowStart := minTime.Add(-twoHours)
+	windowEnd := maxTime.Add(twoHours)
+
+	// 过滤日报：只保留在时间窗口内的记录，并使用 set 去重（按小区号+时间+原因）
+	seen := make(map[string]bool)
+	type indexedDaily struct {
+		idx int
+		rec DailyRecord
+	}
+	var relevant []indexedDaily
+	for i, dr := range dailyRecords {
+		if dr.OccurTime.Before(windowStart) || dr.OccurTime.After(windowEnd) {
+			continue
+		}
+		key := dr.CellID + "|" + dr.OccurTimeStr + "|" + dr.InterruptReason
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		relevant = append(relevant, indexedDaily{idx: i, rec: dr})
+	}
 
 	var sb strings.Builder
 	sb.WriteString(`你是一个通信网络数据匹配专家。请根据以下月报记录，从日报数据中找出最匹配的「中断原因」。
@@ -877,13 +1079,6 @@ func buildAIPrompt(monthlyRecords []MonthlyRecord, dailyRecords []DailyRecord, b
 
 `)
 
-	// 构建最近的日报索引：按时间排序后的日报
-	type dailyIdx struct {
-		idx  int
-		rec  DailyRecord
-		diff time.Duration
-	}
-
 	sb.WriteString("以下是需要匹配的月报记录列表（每条包含索引、小区名称、时间）：\n")
 	for offset, mr := range batch {
 		sb.WriteString(fmt.Sprintf("- 索引 %d: 小区=", batchStart+offset))
@@ -893,12 +1088,16 @@ func buildAIPrompt(monthlyRecords []MonthlyRecord, dailyRecords []DailyRecord, b
 		sb.WriteString("\n")
 	}
 
-	// 为每条月报记录寻找最近的日报候选
-	sb.WriteString("\n以下是日报记录列表（供匹配参考）：\n")
-	// 构建一个日报时间索引，只输出时间接近的记录
-	for i, dr := range dailyRecords {
+	// 输出时间窗口内的日报记录（去重后）
+	sb.WriteString(fmt.Sprintf("\n以下是与本批时间窗口匹配的日报记录列表（共 %d 条，供匹配参考）：\n", len(relevant)))
+	for _, item := range relevant {
 		sb.WriteString(fmt.Sprintf("  D%d: 小区号=%s, 时间=%s, 中断原因=%s\n",
-			i, dr.CellID, dr.OccurTimeStr, dr.InterruptReason))
+			item.idx, item.rec.CellID, item.rec.OccurTimeStr, item.rec.InterruptReason))
+	}
+
+	// 如果没有相关日报记录，提示 AI
+	if len(relevant) == 0 {
+		sb.WriteString("\n注意：本批无时间窗口内的日报记录，请将所有 reason 设为空字符串。\n")
 	}
 
 	sb.WriteString("\n请返回 JSON 格式的匹配结果，包含每个索引对应的中断原因。如果某条记录无法匹配，对应的 reason 设为空字符串。")
@@ -1043,6 +1242,12 @@ func (a *App) DeepseekEnhanceMatching(monthlyPath, dailyPath string) ([]MatchRes
 			}
 		}
 
+		// 预建日报索引 map：按中断原因快速查找
+		reasonMap := make(map[string][]DailyRecord)
+		for _, dr := range dailyRecords {
+			reasonMap[dr.InterruptReason] = append(reasonMap[dr.InterruptReason], dr)
+		}
+
 		for _, item := range matchResp.Matches {
 			idx := item.Index
 			reason := strings.TrimSpace(item.Reason)
@@ -1051,22 +1256,34 @@ func (a *App) DeepseekEnhanceMatching(monthlyPath, dailyPath string) ([]MatchRes
 			}
 
 			mr := unmatchedMonthly[idx]
-			// 找到匹配的日报记录（暂不校验时间窗口）
-			for _, dr := range dailyRecords {
-				if dr.InterruptReason == reason {
-					timeDiff := mr.OccurTime.Sub(dr.OccurTime)
-					similarity := a.CalculateSimilarity(mr.CellName, dr.CellID)
-
+			// 优先精确匹配中断原因
+			if matchedDRs, ok := reasonMap[reason]; ok {
+				// 取时间最接近的一条日报
+				var bestDR *DailyRecord
+				var bestDiff time.Duration
+				for k := range matchedDRs {
+					diff := mr.OccurTime.Sub(matchedDRs[k].OccurTime)
+					absDiff := diff
+					if absDiff < 0 {
+						absDiff = -absDiff
+					}
+					if bestDR == nil || absDiff < bestDiff {
+						bestDR = &matchedDRs[k]
+						bestDiff = absDiff
+					}
+				}
+				if bestDR != nil {
+					timeDiff := mr.OccurTime.Sub(bestDR.OccurTime)
+					similarity := a.CalculateSimilarity(mr.CellName, bestDR.CellID)
 					results = append(results, MatchResult{
 						MonthlyCellName: mr.CellName,
-						DailyCellID:     dr.CellID,
+						DailyCellID:     bestDR.CellID,
 						TimeDiff:        formatTimeDiff(timeDiff),
 						SimilarityScore: math.Round(similarity*10000) / 10000,
 						InterruptReason: reason,
 						AIMatched:       true,
 					})
 					aiMatched++
-					break
 				}
 			}
 		}

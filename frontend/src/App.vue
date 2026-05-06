@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 
 // Wails 自动生成的绑定
-import { OpenFileA, OpenFileB, ParseHeaders, RunMatch, ExportResults, SetDeepseekAPIKey, GetDeepseekStatus, DeepseekEnhanceMatching } from '../wailsjs/go/main/App'
+import { OpenFileA, OpenFileB, ParseHeaders, RunMatch, ExportResults, SetDeepseekAPIKey, GetDeepseekStatus, DeepseekEnhanceMatching, ClearAICache, GetAICacheInfo } from '../wailsjs/go/main/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
 // ----------- 文件与列映射 -----------
@@ -73,6 +73,23 @@ const deepseekKey = ref('')
 const deepseekReady = ref(false)
 const showApiInput = ref(false)
 const aiEnhancing = ref(false)
+
+// ----------- AI 缓存状态 -----------
+const cacheInfo = ref({ count: 0, filePath: '' })
+
+async function refreshCacheInfo() {
+  try { cacheInfo.value = await GetAICacheInfo() } catch { /* ignore */ }
+}
+
+async function clearCache() {
+  try {
+    const msg = await ClearAICache()
+    await refreshCacheInfo()
+    errorMsg.value = ''
+  } catch (e) {
+    errorMsg.value = '清除缓存失败: ' + (e.message || e)
+  }
+}
 
 // ----------- 文件选择 -----------
 async function selectFileA() {
@@ -206,6 +223,8 @@ async function saveApiKey() {
 onMounted(async () => {
   // 检查 Deepseek 状态
   deepseekReady.value = await GetDeepseekStatus()
+  // 检查 AI 缓存状态
+  await refreshCacheInfo()
   // 监听匹配进度事件
   EventsOn('match-progress', (data) => {
     progress.value = {
@@ -458,6 +477,26 @@ function scoreClass(score) {
             <span v-else class="api-status na">未配置</span>
           </div>
         </transition>
+      </div>
+
+      <!-- AI 缓存管理 -->
+      <div class="cache-config" v-if="cacheInfo.count >= 0">
+        <button class="btn btn-text" @click="refreshCacheInfo">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>
+            <path d="M21 3v5h-5"/>
+          </svg>
+          AI 缓存：{{ cacheInfo.count }} 条
+        </button>
+        <button
+          v-if="cacheInfo.count > 0"
+          class="btn btn-sm btn-outline btn-danger-outline"
+          @click="clearCache"
+          :disabled="loading"
+          style="margin-left: 8px"
+        >
+          清除缓存
+        </button>
       </div>
 
       <!-- 错误提示 -->
@@ -827,6 +866,16 @@ function scoreClass(score) {
 
 /* ===== Deepseek 配置 ===== */
 .deepseek-config { margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06); }
+.cache-config {
+  margin-top: 12px; display: flex; align-items: center; gap: 6px;
+}
+.btn-danger-outline {
+  border-color: rgba(220,38,38,0.25); color: #fca5a5;
+}
+.btn-danger-outline:hover:not(:disabled) {
+  background: rgba(220,38,38,0.1);
+  border-color: rgba(220,38,38,0.4);
+}
 .status-dot {
   display: inline-block; width: 8px; height: 8px; border-radius: 50%;
   background: rgba(255,255,255,0.2);

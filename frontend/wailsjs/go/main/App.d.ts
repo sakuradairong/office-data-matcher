@@ -6,9 +6,13 @@ export function CalculateSimilarity(arg1:string,arg2:string):Promise<number>;
 
 export function CleanString(arg1:string):Promise<string>;
 
+export function ClearAICache():Promise<string>;
+
 export function DeepseekEnhanceMatching(arg1:string,arg2:string):Promise<Array<main.MatchResult>>;
 
 export function ExportResults(arg1:Array<main.MatchResult>):Promise<string>;
+
+export function GetAICacheInfo():Promise<Record<string, any>>;
 
 export function GetDeepseekStatus():Promise<boolean>;
 
