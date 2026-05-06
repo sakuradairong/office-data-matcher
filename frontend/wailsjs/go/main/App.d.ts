@@ -28,6 +28,8 @@ export function ParseHeaders(arg1:string):Promise<Array<string>>;
 
 export function RunMatch(arg1:main.MatchConfig):Promise<Array<main.MatchResult>>;
 
+export function RunMatchWithAI(arg1:main.MatchConfig):Promise<Array<main.MatchResult>>;
+
 export function SetDeepseekAPIKey(arg1:string):Promise<string>;
 
 export function StartMatching(arg1:string,arg2:string):Promise<Array<main.MatchResult>>;

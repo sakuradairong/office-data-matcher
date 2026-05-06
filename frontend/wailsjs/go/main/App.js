@@ -54,6 +54,10 @@ export function RunMatch(arg1) {
   return window['go']['main']['App']['RunMatch'](arg1);
 }
 
+export function RunMatchWithAI(arg1) {
+  return window['go']['main']['App']['RunMatchWithAI'](arg1);
+}
+
 export function SetDeepseekAPIKey(arg1) {
   return window['go']['main']['App']['SetDeepseekAPIKey'](arg1);
 }

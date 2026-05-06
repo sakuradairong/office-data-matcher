@@ -131,7 +131,7 @@ type AICacheEntry struct {
 // AICache AI 响应缓存（持久化到临时文件）
 type AICache struct {
 	Entries  []AICacheEntry `json:"entries"`
-	mu       sync.RWMutex
+	mu       sync.RWMutex    // 小写，必须保持非导出以兼容 JSON 序列化
 	filePath string
 	maxSize  int // 最大缓存条目数
 }
@@ -443,16 +443,20 @@ func min(a, b int) int {
 
 // CalculateSimilarity 计算清洗后中文名称的相似度（基于 Levenshtein 距离归一化）
 func (a *App) CalculateSimilarity(s1, s2 string) float64 {
-	return calcSimilarity(s1, s2, nonChineseRegex)
+	return calcSimilarity(s1, s2, nonChineseRegex, false)
 }
 
 // calcSimilarity 带自定义正则的相似度计算；reg 为 nil 时不做清洗直接比对
-func calcSimilarity(s1, s2 string, reg *regexp.Regexp) float64 {
+func calcSimilarity(s1, s2 string, reg *regexp.Regexp, caseSensitive bool) float64 {
 	clean1 := s1
 	clean2 := s2
 	if reg != nil {
 		clean1 = reg.ReplaceAllString(s1, "")
 		clean2 = reg.ReplaceAllString(s2, "")
+	}
+	if !caseSensitive {
+		clean1 = strings.ToLower(clean1)
+		clean2 = strings.ToLower(clean2)
 	}
 
 	r1 := []rune(clean1)
@@ -543,16 +547,23 @@ func getCell(row []string, idx int) string {
 	return strings.TrimSpace(row[idx])
 }
 
-// parseCSVLine 简单 CSV 行解析（支持双引号包裹的字段）
+// parseCSVLine 简单 CSV 行解析（支持双引号包裹字段和转义双引号 "" → "）
 func parseCSVLine(line string) []string {
 	var fields []string
 	var current strings.Builder
 	inQuotes := false
+	runes := []rune(line)
 
-	for _, ch := range line {
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
 		switch {
 		case ch == '"':
-			inQuotes = !inQuotes
+			if inQuotes && i+1 < len(runes) && runes[i+1] == '"' {
+				current.WriteRune('"')
+				i++
+			} else {
+				inQuotes = !inQuotes
+			}
 		case ch == ',' && !inQuotes:
 			fields = append(fields, strings.TrimSpace(current.String()))
 			current.Reset()
@@ -884,7 +895,7 @@ func (a *App) RunMatch(config MatchConfig) ([]MatchResult, error) {
 			cleanB := cleanWithRegex(matchStrB, reg)
 			if cleanA == "" || cleanB == "" { continue }
 
-			similarity := calcSimilarity(matchStrA, matchStrB, reg)
+			similarity := calcSimilarity(matchStrA, matchStrB, reg, config.CaseSensitive)
 
 			if i < maxPreview {
 				fmt.Printf("[DEBUG] | A[%d]='%s'→'%s' | B='%s'→'%s' | 相似度=%.4f\n",
@@ -936,9 +947,221 @@ func (a *App) RunMatch(config MatchConfig) ([]MatchResult, error) {
 	return results, nil
 }
 
-type rowAndScore struct {
-	row   []string
-	score float64
+// RunMatchWithAI 执行基础匹配 + Deepseek AI 增强匹配（配置驱动）
+func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
+	if a.deepseekKey == "" {
+		return nil, fmt.Errorf("请先设置 Deepseek API 密钥")
+	}
+
+	// 1. 先执行基础匹配
+	results, err := a.RunMatch(config)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 重新读取数据，找出未被基础匹配覆盖的 A 表行
+	rowsA, err := a.readRawRows(config.FileAPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 A 表失败: %v", err)
+	}
+	rowsB, err := a.readRawRows(config.FileBPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 B 表失败: %v", err)
+	}
+	if len(rowsA) < 2 || len(rowsB) < 2 {
+		return results, nil
+	}
+
+	dataA := rowsA[1:]
+	dataB := rowsB[1:]
+
+	// 用 RowAData 快速判断哪些 A 行已经被匹配
+	matchedSet := make(map[string]bool)
+	for _, r := range results {
+		matchedSet[strings.Join(r.RowAData, "\x00")] = true
+	}
+
+	var unmatchedA [][]string
+	for _, row := range dataA {
+		if !matchedSet[strings.Join(row, "\x00")] {
+			unmatchedA = append(unmatchedA, row)
+		}
+	}
+
+	if len(unmatchedA) == 0 {
+		a.emitProgress(1, 1, "全部已匹配，无需 AI 增强", "done")
+		return results, nil
+	}
+
+	// 3. AI 增强匹配
+	timeWindow := config.TimeWindow
+	if timeWindow <= 0 {
+		timeWindow = 12
+	}
+	windowDuration := time.Duration(timeWindow * float64(time.Hour))
+	useTime := config.ColATimeIndex >= 0 && config.ColBTimeIndex >= 0
+
+	totalUnmatched := len(unmatchedA)
+	a.emitProgress(0, totalUnmatched,
+		fmt.Sprintf("AI 增强匹配：还有 %d 条未匹配记录，正在调用 Deepseek...", totalUnmatched),
+		"ai-enhancing")
+
+	batchSize := 8
+	aiMatched := 0
+
+	for batchStart := 0; batchStart < totalUnmatched; batchStart += batchSize {
+		end := batchStart + batchSize
+		if end > totalUnmatched {
+			end = totalUnmatched
+		}
+
+		a.emitProgress(batchStart+1, totalUnmatched,
+			fmt.Sprintf("AI 分析中 %d/%d (第 %d 批)...", end, totalUnmatched, (batchStart/batchSize)+1),
+			"ai-enhancing")
+
+		batch := unmatchedA[batchStart:end]
+
+		// 计算本批 A 表的时间范围
+		var minTime, maxTime time.Time
+		hasBatchTime := false
+		if useTime {
+			for _, row := range batch {
+				t, err := parseTimeFlexible(getCell(row, config.ColATimeIndex))
+				if err != nil {
+					continue
+				}
+				if !hasBatchTime {
+					minTime, maxTime = t, t
+					hasBatchTime = true
+				} else {
+					if t.Before(minTime) {
+						minTime = t
+					}
+					if t.After(maxTime) {
+						maxTime = t
+					}
+				}
+			}
+		}
+
+		// 过滤 B 表在时间窗口内的行（用户配置时间窗口 + 额外余量覆盖批次跨度）
+		var relevantB [][]string
+		if hasBatchTime && useTime {
+			padding := windowDuration + 3*time.Hour
+			ws := minTime.Add(-padding)
+			we := maxTime.Add(padding)
+			for _, row := range dataB {
+				t, err := parseTimeFlexible(getCell(row, config.ColBTimeIndex))
+				if err != nil || t.Before(ws) || t.After(we) {
+					continue
+				}
+				relevantB = append(relevantB, row)
+			}
+		} else {
+			// 无时间列时限制 B 表条数以控制 token 消耗
+			maxB := 200
+			if len(dataB) < maxB {
+				maxB = len(dataB)
+			}
+			relevantB = dataB[:maxB]
+		}
+
+		// 构建 AI 提示
+		prompt := a.buildGenericAIPrompt(batch, relevantB, config, windowDuration, hasBatchTime)
+		aiResp, err := a.callDeepseekAPI(prompt)
+		if err != nil {
+			continue
+		}
+
+		// 解析 AI 返回
+		var matchResp struct {
+			Matches []struct {
+				Index int    `json:"index"`
+				Value string `json:"value"`
+			} `json:"matches"`
+		}
+		parseErr := json.Unmarshal([]byte(aiResp), &matchResp)
+		if parseErr != nil {
+			if idx := strings.Index(aiResp, "{"); idx >= 0 {
+				if endIdx := strings.LastIndex(aiResp, "}"); endIdx > idx {
+					parseErr = json.Unmarshal([]byte(aiResp[idx:endIdx+1]), &matchResp)
+				}
+			}
+		}
+		if parseErr != nil {
+			fmt.Printf("[AI-WARN] 响应解析失败 (第 %d 批): %s\n   原始响应: %.200s\n",
+				(batchStart/batchSize)+1, parseErr.Error(), aiResp)
+			continue
+		}
+
+		for _, item := range matchResp.Matches {
+			idx := item.Index
+			val := strings.TrimSpace(item.Value)
+			if idx < 0 || idx >= len(batch) || val == "" {
+				continue
+			}
+			rowA := batch[idx]
+			mr := MatchResult{
+				RowAData:        rowA,
+				RowBKey:         "",
+				ExtractValue:    val,
+				SimilarityScore: 0,
+				AIMatched:       true,
+			}
+			results = append(results, mr)
+			aiMatched++
+		}
+	}
+
+	a.emitProgress(totalUnmatched, totalUnmatched,
+		fmt.Sprintf("AI 增强完成！基础匹配 %d 条 + AI 补充 %d 条 = 共 %d 条",
+			len(results)-aiMatched, aiMatched, len(results)), "done")
+
+	return results, nil
+}
+
+// buildGenericAIPrompt 构建通用 AI 匹配提示词
+func (a *App) buildGenericAIPrompt(unmatched, bRows [][]string, config MatchConfig, windowDuration time.Duration, hasTime bool) []deepseekMessage {
+	var sb strings.Builder
+	sb.WriteString("你是一个数据匹配专家。请根据以下 A 表记录，从 B 表数据中找出最匹配的记录。\n\n")
+	sb.WriteString("匹配规则：\n")
+	sb.WriteString("1. 根据文本相似度匹配（注意中文字段的核心含义，忽略字母数字前缀后缀）\n")
+	if hasTime {
+		sb.WriteString(fmt.Sprintf("2. 时间差应在 %.0f 小时内\n", windowDuration.Hours()))
+	}
+	sb.WriteString(fmt.Sprintf("3. 返回匹配到的 B 表记录的目标列值（第 %d 列）\n\n", config.ColBExtractIndex+1))
+
+	sb.WriteString("请严格按照以下 JSON 格式返回结果：\n")
+	sb.WriteString(`{"matches":[{"index":0,"value":"匹配到的目标列值"},{"index":1,"value":""}]}` + "\n")
+	sb.WriteString("如果某条无法匹配，value 设为空字符串。\n\n")
+
+	sb.WriteString(fmt.Sprintf("A 表记录（需要匹配，共 %d 条）：\n", len(unmatched)))
+	for i, row := range unmatched {
+		matchVal := getCell(row, config.ColAMatchIndex)
+		sb.WriteString(fmt.Sprintf("- 索引 %d: 「%s」", i, matchVal))
+		if hasTime {
+			sb.WriteString(fmt.Sprintf(", 时间=%s", getCell(row, config.ColATimeIndex)))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString(fmt.Sprintf("\nB 表参考数据（共 %d 条）：\n", len(bRows)))
+	for _, row := range bRows {
+		matchVal := getCell(row, config.ColBMatchIndex)
+		extractVal := getCell(row, config.ColBExtractIndex)
+		sb.WriteString(fmt.Sprintf("  「%s」 → 目标列值: 「%s」", matchVal, extractVal))
+		if hasTime {
+			sb.WriteString(fmt.Sprintf(", 时间=%s", getCell(row, config.ColBTimeIndex)))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("\n请返回 JSON 格式的匹配结果。")
+
+	return []deepseekMessage{
+		{Role: "system", Content: "你是一个数据匹配专家。请严格按照 JSON 格式返回结果，不要添加额外说明。"},
+		{Role: "user", Content: sb.String()},
+	}
 }
 
 // ---------- Deepseek AI 增强匹配 ----------
@@ -1043,9 +1266,9 @@ func buildAIPrompt(monthlyRecords []MonthlyRecord, dailyRecords []DailyRecord, b
 	}
 
 	// 时间窗口前后各扩展 3 小时，确保覆盖 AI 匹配所需的 ±2h
-	twoHours := 3 * time.Hour
-	windowStart := minTime.Add(-twoHours)
-	windowEnd := maxTime.Add(twoHours)
+	paddingHours := 3 * time.Hour
+	windowStart := minTime.Add(-paddingHours)
+	windowEnd := maxTime.Add(paddingHours)
 
 	// 过滤日报：只保留在时间窗口内的记录，并使用 set 去重（按小区号+时间+原因）
 	seen := make(map[string]bool)
@@ -1118,7 +1341,8 @@ type aiMatchResponse struct {
 	Matches []aiMatchItem `json:"matches"`
 }
 
-// DeepseekEnhanceMatching 使用 Deepseek AI 进行增强匹配
+// DeepseekEnhanceMatching 使用 Deepseek AI 进行增强匹配（月报/日报专用，已弃用）
+// Deprecated: 请使用 RunMatchWithAI(config MatchConfig)，它基于通用列映射配置
 func (a *App) DeepseekEnhanceMatching(monthlyPath, dailyPath string) ([]MatchResult, error) {
 	if a.deepseekKey == "" {
 		return nil, fmt.Errorf("请先设置 Deepseek API 密钥（点击「配置 API」按钮）")
@@ -1209,6 +1433,12 @@ func (a *App) DeepseekEnhanceMatching(monthlyPath, dailyPath string) ([]MatchRes
 		fmt.Sprintf("AI 增强匹配：还有 %d 条未匹配记录，正在调用 Deepseek...", len(unmatchedMonthly)),
 		"ai-enhancing")
 
+	// 预建日报索引 map：按中断原因快速查找（仅构建一次）
+	reasonMap := make(map[string][]DailyRecord)
+	for _, dr := range dailyRecords {
+		reasonMap[dr.InterruptReason] = append(reasonMap[dr.InterruptReason], dr)
+	}
+
 	// 分批调用 Deepseek API（每批 8 条）
 	batchSize := 8
 	totalUnmatched := len(unmatchedMonthly)
@@ -1240,12 +1470,6 @@ func (a *App) DeepseekEnhanceMatching(monthlyPath, dailyPath string) ([]MatchRes
 					json.Unmarshal([]byte(aiResp[idx:endIdx+1]), &matchResp)
 				}
 			}
-		}
-
-		// 预建日报索引 map：按中断原因快速查找
-		reasonMap := make(map[string][]DailyRecord)
-		for _, dr := range dailyRecords {
-			reasonMap[dr.InterruptReason] = append(reasonMap[dr.InterruptReason], dr)
 		}
 
 		for _, item := range matchResp.Matches {

@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 
 // Wails 自动生成的绑定
-import { OpenFileA, OpenFileB, ParseHeaders, RunMatch, ExportResults, SetDeepseekAPIKey, GetDeepseekStatus, DeepseekEnhanceMatching, ClearAICache, GetAICacheInfo } from '../wailsjs/go/main/App'
+import { OpenFileA, OpenFileB, ParseHeaders, RunMatch, RunMatchWithAI, ExportResults, SetDeepseekAPIKey, GetDeepseekStatus, ClearAICache, GetAICacheInfo } from '../wailsjs/go/main/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
 // ----------- 文件与列映射 -----------
@@ -33,8 +33,6 @@ const matchConfig = ref({
 })
 
 // ----------- 状态 -----------
-const monthlyPath = ref('')
-const dailyPath = ref('')
 const loading = ref(false)
 const results = ref([])
 const exporting = ref(false)
@@ -152,8 +150,12 @@ async function startMatching() {
 
 // ----------- Deepseek AI 增强匹配 -----------
 async function startAIEnhance() {
-  if (!monthlyPath.value || !dailyPath.value) {
-    errorMsg.value = '请先选择月报和日报文件'
+  if (!fileAPath.value || !fileBPath.value) {
+    errorMsg.value = '请先选择 A 表和 B 表文件'
+    return
+  }
+  if (colAMatchIdx.value < 0 || colBMatchIdx.value < 0 || colBExtractIdx.value < 0) {
+    errorMsg.value = '请完成列映射配置（A表匹配列 / B表匹配列 / B表提取列）'
     return
   }
   if (!deepseekReady.value && !deepseekKey.value) {
@@ -161,12 +163,10 @@ async function startAIEnhance() {
     return
   }
 
-  // 清除之前残留的定时器
   cancelProgressTimer()
 
-  // 如果还没保存密钥，先保存
   if (!deepseekReady.value && deepseekKey.value) {
-    const result = await SetDeepseekAPIKey(deepseekKey.value)
+    await SetDeepseekAPIKey(deepseekKey.value)
     deepseekReady.value = await GetDeepseekStatus()
   }
 
@@ -179,7 +179,22 @@ async function startAIEnhance() {
   progress.value = { current: 0, total: 100, message: '正在启动 AI 增强匹配...', phase: 'reading' }
 
   try {
-    const data = await DeepseekEnhanceMatching(monthlyPath.value, dailyPath.value)
+    const config = {
+      fileAPath: fileAPath.value, fileBPath: fileBPath.value,
+      colAMatchIndex: colAMatchIdx.value, colATimeIndex: colATimeIdx.value,
+      colBMatchIndex: colBMatchIdx.value, colBTimeIndex: colBTimeIdx.value,
+      colBExtractIndex: colBExtractIdx.value,
+      regexPattern: matchConfig.value.regexPattern || '',
+      timeWindow: Number(matchConfig.value.timeWindow) || 12,
+      threshold: Number(matchConfig.value.threshold) || 0.65,
+      allMatches: matchConfig.value.allMatches || false,
+      caseSensitive: matchConfig.value.caseSensitive || false,
+      sortBy: matchConfig.value.sortBy || '',
+      maxPreview: Number(matchConfig.value.maxPreview) || 0,
+      exportFormat: matchConfig.value.exportFormat || 'xlsx',
+      includeHeader: matchConfig.value.includeHeader !== false
+    }
+    const data = await RunMatchWithAI(config)
     results.value = data
     stats.value.matched = data.length
   } catch (err) {
