@@ -126,26 +126,30 @@ async function startMatching() {
   progress.value = { current: 0, total: 100, message: '准备中...', phase: 'reading' }
 
   try {
-    const config = {
-      fileAPath: fileAPath.value, fileBPath: fileBPath.value,
-      colAMatchIndex: colAMatchIdx.value, colATimeIndex: colATimeIdx.value,
-      colBMatchIndex: colBMatchIdx.value, colBTimeIndex: colBTimeIdx.value,
-      colBExtractIndex: colBExtractIdx.value,
-      regexPattern: matchConfig.value.regexPattern || '',
-      timeWindow: Number(matchConfig.value.timeWindow) || 12,
-      threshold: Number(matchConfig.value.threshold) || 0.65,
-      allMatches: matchConfig.value.allMatches || false,
-      caseSensitive: matchConfig.value.caseSensitive || false,
-      sortBy: matchConfig.value.sortBy || '',
-      maxPreview: Number(matchConfig.value.maxPreview) || 0,
-      exportFormat: matchConfig.value.exportFormat || 'xlsx',
-      includeHeader: matchConfig.value.includeHeader !== false
-    }
-    const data = await RunMatch(config)
+    const data = await RunMatch(buildMatchConfig())
     results.value = data; stats.value.matched = data.length
   } catch (err) { errorMsg.value = typeof err === 'string' ? err : (err.message || '匹配失败')
     hideProgressNow()
   } finally { loading.value = false; if (!errorMsg.value) scheduleProgressDone() }
+}
+
+// buildMatchConfig 从响应式状态构建 MatchConfig 对象（消除重复）
+function buildMatchConfig() {
+  return {
+    fileAPath: fileAPath.value, fileBPath: fileBPath.value,
+    colAMatchIndex: colAMatchIdx.value, colATimeIndex: colATimeIdx.value,
+    colBMatchIndex: colBMatchIdx.value, colBTimeIndex: colBTimeIdx.value,
+    colBExtractIndex: colBExtractIdx.value,
+    regexPattern: matchConfig.value.regexPattern || '',
+    timeWindow: Number(matchConfig.value.timeWindow) || 12,
+    threshold: Number(matchConfig.value.threshold) || 0.65,
+    allMatches: matchConfig.value.allMatches || false,
+    caseSensitive: matchConfig.value.caseSensitive || false,
+    sortBy: matchConfig.value.sortBy || '',
+    maxPreview: Number(matchConfig.value.maxPreview) || 0,
+    exportFormat: matchConfig.value.exportFormat || 'xlsx',
+    includeHeader: matchConfig.value.includeHeader !== false
+  }
 }
 
 // ----------- Deepseek AI 增强匹配 -----------
@@ -179,22 +183,7 @@ async function startAIEnhance() {
   progress.value = { current: 0, total: 100, message: '正在启动 AI 增强匹配...', phase: 'reading' }
 
   try {
-    const config = {
-      fileAPath: fileAPath.value, fileBPath: fileBPath.value,
-      colAMatchIndex: colAMatchIdx.value, colATimeIndex: colATimeIdx.value,
-      colBMatchIndex: colBMatchIdx.value, colBTimeIndex: colBTimeIdx.value,
-      colBExtractIndex: colBExtractIdx.value,
-      regexPattern: matchConfig.value.regexPattern || '',
-      timeWindow: Number(matchConfig.value.timeWindow) || 12,
-      threshold: Number(matchConfig.value.threshold) || 0.65,
-      allMatches: matchConfig.value.allMatches || false,
-      caseSensitive: matchConfig.value.caseSensitive || false,
-      sortBy: matchConfig.value.sortBy || '',
-      maxPreview: Number(matchConfig.value.maxPreview) || 0,
-      exportFormat: matchConfig.value.exportFormat || 'xlsx',
-      includeHeader: matchConfig.value.includeHeader !== false
-    }
-    const data = await RunMatchWithAI(config)
+    const data = await RunMatchWithAI(buildMatchConfig())
     results.value = data
     stats.value.matched = data.length
   } catch (err) {
