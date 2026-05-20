@@ -143,6 +143,7 @@ const (
 	defaultMaxBNoTime    = 200
 	defaultAIWindowPadH  = 3.0
 	maxPromptBChars      = 80000 // B 表数据在 prompt 中的最大字符数
+	maxMatchDuration     = 10 * time.Minute // 单次匹配最大执行时间
 )
 // rebuildIndexes 从切片重建索引 map（反序列化或裁剪后调用）
 func (c *AICache) rebuildIndexes() {
@@ -721,6 +722,7 @@ func (a *App) prepareMatch(config MatchConfig) (*matchPrep, error) {
 }
 
 // RunMatch 接收完整 MatchConfig，按列索引执行通用匹配
+// RunMatch 接收完整 MatchConfig，按列索引执行通用匹配
 func (a *App) RunMatch(config MatchConfig) ([]MatchResult, error) {
 	prep, err := a.prepareMatch(config)
 	if err != nil {
@@ -734,6 +736,7 @@ func (a *App) runMatchOnData(prep *matchPrep, config MatchConfig) ([]MatchResult
 	useTime := config.ColATimeIndex >= 0 && config.ColBTimeIndex >= 0
 	totalA := len(prep.dataA)
 	var results []MatchResult
+	startTime := time.Now() // 超时保护
 
 	useAllMatches := config.AllMatches
 	maxPreview := config.MaxPreview
@@ -766,7 +769,10 @@ func (a *App) runMatchOnData(prep *matchPrep, config MatchConfig) ([]MatchResult
 		bExtractVal[bIdx] = getCell(rowB, config.ColBExtractIndex)
 	}
 	for i, rowA := range prep.dataA {
-		// 定期检查是否取消
+		// 定期检查超时 / 取消
+		if time.Since(startTime) > maxMatchDuration {
+			return results, fmt.Errorf("匹配超时（超过 %v）", maxMatchDuration)
+		}
 		if a.ctx != nil {
 			select {
 			case <-a.ctx.Done():
@@ -800,7 +806,12 @@ func (a *App) runMatchOnData(prep *matchPrep, config MatchConfig) ([]MatchResult
 		// 收集该 A 行的所有候选匹配
 		var candidates []MatchResult
 
+	bCheck := 0
 	for bIdx := range prep.dataB {
+		bCheck++
+		if bCheck%500 == 0 && time.Since(startTime) > maxMatchDuration {
+			return results, fmt.Errorf("匹配超时（超过 %v）", maxMatchDuration)
+		}
 		matchStrB := origBMatch[bIdx]
 		if matchStrB == "" {
 			continue
@@ -1229,7 +1240,7 @@ func (a *App) callAIAPI(messages []deepseekMessage) (string, error) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+a.apiKey)
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("调用 AI API 失败: %v", err)

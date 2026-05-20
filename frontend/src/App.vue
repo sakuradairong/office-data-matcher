@@ -117,6 +117,7 @@ async function selectFileB() {
 
 // ----------- 智能匹配 -----------
 async function startMatching() {
+  if (loading.value) return // 防止重复点击
   if (!fileAPath.value || !fileBPath.value) return
   if (colAMatchIdx.value < 0 || colBMatchIdx.value < 0 || colBExtractIdx.value < 0) {
     errorMsg.value = '请完成列映射配置（A表匹配列 / B表匹配列 / B表提取列）'
@@ -156,6 +157,7 @@ function buildMatchConfig() {
 
 // ----------- AI 增强匹配 -----------
 async function startAIEnhance() {
+  if (loading.value) return // 防止重复点击
   if (!fileAPath.value || !fileBPath.value) {
     errorMsg.value = '请先选择 A 表和 B 表文件'
     return
@@ -346,7 +348,7 @@ function scoreClass(score) {
         </button>
         <button
           class="btn btn-ai"
-          :disabled="!canMatch || !aiReady"
+          :disabled="!canMatch || !aiReady || loading"
           @click="startAIEnhance"
         >
           <template v-if="aiEnhancing">
