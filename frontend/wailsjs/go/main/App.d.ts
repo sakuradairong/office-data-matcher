@@ -12,7 +12,7 @@ export function ExportResults(arg1:Array<main.MatchResult>):Promise<string>;
 
 export function GetAICacheInfo():Promise<main.AICacheInfo>;
 
-export function GetDeepseekStatus():Promise<boolean>;
+export function GetAIStatus():Promise<Record<string, string>>;
 
 export function OpenDailyReport():Promise<string>;
 
@@ -28,4 +28,6 @@ export function RunMatch(arg1:main.MatchConfig):Promise<Array<main.MatchResult>>
 
 export function RunMatchWithAI(arg1:main.MatchConfig):Promise<Array<main.MatchResult>>;
 
-export function SetDeepseekAPIKey(arg1:string):Promise<string>;
+export function SetAIConfig(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function SetAPIKey(arg1:string):Promise<string>;

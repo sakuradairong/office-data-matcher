@@ -72,7 +72,7 @@ type MatchConfig struct {
 	IncludeHeader bool   `json:"includeHeader"` // 导出时是否包含表头行
 }
 
-// ---------- Deepseek API 类型 ----------
+// ---------- OpenAI 兼容 API 类型 ----------
 
 type deepseekMessage struct {
 	Role    string `json:"role"`
@@ -322,9 +322,11 @@ type matchPrep struct {
 // ---------- App 结构体 ----------
 
 type App struct {
-	ctx          context.Context
-	deepseekKey  string
-	aiCache      *AICache
+	ctx         context.Context
+	apiKey      string // AI API 密钥（兼容 OpenAI/Deepseek/本地模型）
+	apiEndpoint string // API 端点（默认 https://api.deepseek.com/v1/chat/completions）
+	apiModel    string // 模型名称（默认 deepseek-chat）
+	aiCache     *AICache
 
 	// 最近一次匹配的配置和表头（供导出使用）
 	dataMu      sync.RWMutex
@@ -360,18 +362,36 @@ func (a *App) emitProgress(current, total int, message, phase string) {
 	})
 }
 
-// SetDeepseekAPIKey 设置 Deepseek API 密钥（仅保存在内存中）
-func (a *App) SetDeepseekAPIKey(key string) string {
-	a.deepseekKey = strings.TrimSpace(key)
-	if a.deepseekKey == "" {
-		return "已清除 Deepseek API 密钥"
+// SetAIConfig 统一设置 AI API 配置（端点、模型、密钥）
+func (a *App) SetAIConfig(endpoint, model, key string) string {
+	if endpoint != "" {
+		a.apiEndpoint = strings.TrimSpace(endpoint)
 	}
-	return "Deepseek API 密钥已设置"
+	if model != "" {
+		a.apiModel = strings.TrimSpace(model)
+	}
+	if key != "" {
+		a.apiKey = strings.TrimSpace(key)
+	}
+	return fmt.Sprintf("AI 配置已更新 (端点=%s, 模型=%s)", a.apiEndpoint, a.apiModel)
 }
 
-// GetDeepseekStatus 返回是否已配置 Deepseek API 密钥
-func (a *App) GetDeepseekStatus() bool {
-	return a.deepseekKey != ""
+// SetAPIKey 设置 AI API 密钥（仅保存在内存中）
+func (a *App) SetAPIKey(key string) string {
+	a.apiKey = strings.TrimSpace(key)
+	if a.apiKey == "" {
+		return "已清除 AI API 密钥"
+	}
+	return "AI API 密钥已设置"
+}
+
+// GetAIStatus 返回 AI API 配置状态
+func (a *App) GetAIStatus() map[string]string {
+	return map[string]string{
+		"ready":    fmt.Sprintf("%v", a.apiKey != ""),
+		"endpoint": a.apiEndpoint,
+		"model":    a.apiModel,
+	}
 }
 
 // ClearAICache 清除所有 AI 缓存
@@ -894,10 +914,10 @@ func parseTimeDiffDuration(s string) time.Duration {
 	return sign * d
 }
 
-// RunMatchWithAI 执行基础匹配 + Deepseek AI 增强匹配（配置驱动）
+// RunMatchWithAI 执行基础匹配 + AI 增强匹配（配置驱动）
 func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
-	if a.deepseekKey == "" {
-		return nil, fmt.Errorf("请先设置 Deepseek API 密钥")
+	if a.apiKey == "" {
+		return nil, fmt.Errorf("请先设置 AI API 密钥")
 	}
 
 	prep, err := a.prepareMatch(config)
@@ -972,7 +992,7 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 
 	totalUnmatched := len(uncachedA)
 	a.emitProgress(0, totalUnmatched,
-		fmt.Sprintf("AI 增强匹配：%d 条命中缓存，%d 条需调用 Deepseek...", cacheHits, totalUnmatched),
+		fmt.Sprintf("AI 增强匹配：%d 条命中缓存，%d 条需调用 AI...", cacheHits, totalUnmatched),
 		"ai-enhancing")
 
 	for batchStart := 0; batchStart < totalUnmatched; batchStart += defaultBatchSize {
@@ -1029,7 +1049,7 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 
 		// 构建 AI 提示
 		prompt := a.buildGenericAIPrompt(batch, relevantB, config, prep.windowDuration, hasBatchTime)
-		aiResp, err := a.callDeepseekAPI(prompt)
+		aiResp, err := a.callAIAPI(prompt)
 		if err != nil {
 			fmt.Printf("[AI-WARN] 第 %d 批 API 调用失败: %v\n", batchNum, err)
 			failedBatches = append(failedBatches, batchNum)
@@ -1152,7 +1172,7 @@ func (a *App) buildGenericAIPrompt(unmatched, bRows [][]string, config MatchConf
 	}
 }
 
-// ---------- Deepseek AI 增强匹配 ----------
+// ---------- AI API 调用 ----------
 
 // hashPrompt 对 prompt 消息计算 SHA256（用于缓存键）
 func hashPrompt(messages []deepseekMessage) string {
@@ -1166,10 +1186,20 @@ func hashPrompt(messages []deepseekMessage) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// callDeepseekAPI 调用 Deepseek Chat API（带缓存）
-func (a *App) callDeepseekAPI(messages []deepseekMessage) (string, error) {
-	if a.deepseekKey == "" {
-		return "", fmt.Errorf("请先设置 Deepseek API 密钥")
+// callAIAPI 调用 OpenAI 兼容 API（Deepseek / OpenAI / 本地模型 等）
+func (a *App) callAIAPI(messages []deepseekMessage) (string, error) {
+	if a.apiKey == "" {
+		return "", fmt.Errorf("请先设置 AI API 密钥")
+	}
+
+	// 默认值
+	endpoint := a.apiEndpoint
+	if endpoint == "" {
+		endpoint = "https://api.deepseek.com/v1/chat/completions"
+	}
+	model := a.apiModel
+	if model == "" {
+		model = "deepseek-chat"
 	}
 
 	hash := hashPrompt(messages)
@@ -1179,46 +1209,45 @@ func (a *App) callDeepseekAPI(messages []deepseekMessage) (string, error) {
 		fmt.Printf("[CACHE] ✓ 命中 AI 缓存 (hash=%s)\n", hash[:12])
 		return cached, nil
 	}
-	fmt.Printf("[CACHE] ✗ 缓存未命中 (hash=%s)，调用 API...\n", hash[:12])
+	fmt.Printf("[CACHE] ✗ 缓存未命中 (hash=%s)，调用 %s...\n", hash[:12], endpoint)
 
 	reqBody := deepseekRequest{
-		Model:       "deepseek-chat",
+		Model:       model,
 		Messages:    messages,
 		Temperature: 0.05,
 		MaxTokens:   2048,
 	}
 
 	bodyBytes, _ := json.Marshal(reqBody)
-	httpReq, err := http.NewRequest("POST", "https://api.deepseek.com/v1/chat/completions",
-		bytes.NewReader(bodyBytes))
+	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", fmt.Errorf("创建请求失败: %v", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+a.deepseekKey)
+	httpReq.Header.Set("Authorization", "Bearer "+a.apiKey)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return "", fmt.Errorf("调用 Deepseek API 失败: %v", err)
+		return "", fmt.Errorf("调用 AI API 失败: %v", err)
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("读取 Deepseek 响应失败: %v", err)
+		return "", fmt.Errorf("读取 AI 响应失败: %v", err)
 	}
 	var dr deepseekResponse
 	if err := json.Unmarshal(respBytes, &dr); err != nil {
-		return "", fmt.Errorf("解析 Deepseek 响应失败: %v", err)
+		return "", fmt.Errorf("解析 AI 响应失败: %v", err)
 	}
 
 	if dr.Error != nil {
-		return "", fmt.Errorf("Deepseek API 错误: %s", dr.Error.Message)
+		return "", fmt.Errorf("AI API 错误: %s", dr.Error.Message)
 	}
 
 	if len(dr.Choices) == 0 {
-		return "", fmt.Errorf("Deepseek 未返回有效结果")
+		return "", fmt.Errorf("AI 未返回有效结果")
 	}
 
 	result := strings.TrimSpace(dr.Choices[0].Message.Content)

@@ -1,8 +1,8 @@
-﻿<script setup>
+<script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 
 // Wails 自动生成的绑定
-import { OpenFileA, OpenFileB, ParseHeaders, RunMatch, RunMatchWithAI, ExportResults, SetDeepseekAPIKey, GetDeepseekStatus, ClearAICache, GetAICacheInfo } from '../wailsjs/go/main/App'
+import { OpenFileA, OpenFileB, ParseHeaders, RunMatch, RunMatchWithAI, ExportResults, SetAIConfig, SetAPIKey, GetAIStatus, ClearAICache, GetAICacheInfo } from '../wailsjs/go/main/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
 // ----------- 文件与列映射 -----------
@@ -66,9 +66,11 @@ function hideProgressNow() {
   showProgress.value = false
 }
 
-// ----------- Deepseek 状态 -----------
-const deepseekKey = ref('')
-const deepseekReady = ref(false)
+// ----------- AI API 配置 -----------
+const apiKey = ref('')
+const apiEndpoint = ref('')
+const apiModel = ref('')
+const aiReady = ref(false)
 const showApiInput = ref(false)
 const aiEnhancing = ref(false)
 
@@ -152,7 +154,7 @@ function buildMatchConfig() {
   }
 }
 
-// ----------- Deepseek AI 增强匹配 -----------
+// ----------- AI 增强匹配 -----------
 async function startAIEnhance() {
   if (!fileAPath.value || !fileBPath.value) {
     errorMsg.value = '请先选择 A 表和 B 表文件'
@@ -162,16 +164,16 @@ async function startAIEnhance() {
     errorMsg.value = '请完成列映射配置（A表匹配列 / B表匹配列 / B表提取列）'
     return
   }
-  if (!deepseekReady.value && !deepseekKey.value) {
-    errorMsg.value = '请先配置 Deepseek API 密钥'
+  if (!aiReady.value && !apiKey.value) {
+    errorMsg.value = '请先配置 AI API 密钥'
     return
   }
 
   cancelProgressTimer()
 
-  if (!deepseekReady.value && deepseekKey.value) {
-    await SetDeepseekAPIKey(deepseekKey.value)
-    deepseekReady.value = await GetDeepseekStatus()
+  if (!aiReady.value && apiKey.value) {
+    await SetAIConfig(apiEndpoint.value, apiModel.value, apiKey.value)
+    aiReady.value = true
   }
 
   aiEnhancing.value = true
@@ -212,12 +214,13 @@ async function exportResult() {
   }
 }
 
-// ----------- Deepseek 密钥管理 -----------
-async function saveApiKey() {
-  if (!deepseekKey.value) return
-  const result = await SetDeepseekAPIKey(deepseekKey.value)
-  deepseekReady.value = await GetDeepseekStatus()
-  if (deepseekReady.value) {
+// ----------- AI API 密钥管理 -----------
+async function saveApiConfig() {
+  if (!apiKey.value) return
+  await SetAIConfig(apiEndpoint.value, apiModel.value, apiKey.value)
+  const status = await GetAIStatus()
+  aiReady.value = status.ready === 'true'
+  if (aiReady.value) {
     setTimeout(() => { showApiInput.value = false }, 1000)
   }
 }
@@ -225,11 +228,15 @@ async function saveApiKey() {
 // ----------- 进度监听 -----------
 
 onMounted(async () => {
-  // 检查 Deepseek 状态
-  deepseekReady.value = await GetDeepseekStatus()
+  // 恢复 AI API 配置
+  try {
+    const status = await GetAIStatus()
+    aiReady.value = status.ready === 'true'
+    apiEndpoint.value = status.endpoint || ''
+    apiModel.value = status.model || ''
+  } catch { /* ignore */ }
   // 检查 AI 缓存状态
   await refreshCacheInfo()
-  // 监听匹配进度事件
   EventsOn('match-progress', (data) => {
     progress.value = {
       current: data.current,
@@ -339,7 +346,7 @@ function scoreClass(score) {
         </button>
         <button
           class="btn btn-ai"
-          :disabled="!canMatch || !deepseekReady"
+          :disabled="!canMatch || !aiReady"
           @click="startAIEnhance"
         >
           <template v-if="aiEnhancing">
@@ -451,33 +458,47 @@ function scoreClass(score) {
         </transition>
       </div>
 
-      <!-- Deepseek API 配置 -->
-      <div class="deepseek-config">
+      <!-- AI API 配置 -->
+      <div class="ai-config">
         <button class="btn btn-text" @click="showApiInput = !showApiInput">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"/>
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/>
           </svg>
-          {{ showApiInput ? '收起 API 配置' : '配置 Deepseek API' }}
-          <span class="status-dot" :class="{ active: deepseekReady }"></span>
+          {{ showApiInput ? '收起 API 配置' : '配置 AI API' }}
+          <span class="status-dot" :class="{ active: aiReady }"></span>
         </button>
         <transition name="slide">
           <div v-if="showApiInput" class="api-input-row">
             <input
+              type="text"
+              v-model="apiEndpoint"
+              placeholder="API 端点 (默认 deepseek)"
+              class="api-input api-endpoint"
+              :disabled="loading"
+            />
+            <input
+              type="text"
+              v-model="apiModel"
+              placeholder="模型 (默认 deepseek-chat)"
+              class="api-input api-model"
+              :disabled="loading"
+            />
+            <input
               type="password"
-              v-model="deepseekKey"
-              placeholder="输入 Deepseek API 密钥 (sk-...)"
+              v-model="apiKey"
+              placeholder="API 密钥 (sk-...)"
               class="api-input"
               :disabled="loading"
             />
             <button
               class="btn btn-sm btn-outline"
-              @click="saveApiKey"
-              :disabled="!deepseekKey || loading"
+              @click="saveApiConfig"
+              :disabled="!apiKey || loading"
             >
               保存
             </button>
-            <span v-if="deepseekReady" class="api-status ok">已配置</span>
+            <span v-if="aiReady" class="api-status ok">已配置</span>
             <span v-else class="api-status na">未配置</span>
           </div>
         </transition>
@@ -868,8 +889,8 @@ function scoreClass(score) {
 .fill-done { background: linear-gradient(90deg, #00b894, #00cec9); }
 .progress-sub { margin-top: 10px; font-size: 12px; color: rgba(255,255,255,0.3); min-height: 20px; }
 
-/* ===== Deepseek 配置 ===== */
-.deepseek-config { margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06); }
+/* ===== AI API 配置 ===== */
+.ai-config { margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06); }
 .cache-config {
   margin-top: 12px; display: flex; align-items: center; gap: 6px;
 }
@@ -896,6 +917,11 @@ function scoreClass(score) {
   transition: border-color 0.2s;
 }
 .api-input:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.12); }
+.api-endpoint,
+.api-model {
+  max-width: 320px;
+  font-size: 13px;
+}
 .api-status { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 6px; }
 .api-status.ok { color: #6ee7b7; background: rgba(16,185,129,0.12); }
 .api-status.na { color: #fcd34d; background: rgba(251,191,36,0.1); }

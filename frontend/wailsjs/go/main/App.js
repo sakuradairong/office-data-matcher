@@ -22,8 +22,8 @@ export function GetAICacheInfo() {
   return window['go']['main']['App']['GetAICacheInfo']();
 }
 
-export function GetDeepseekStatus() {
-  return window['go']['main']['App']['GetDeepseekStatus']();
+export function GetAIStatus() {
+  return window['go']['main']['App']['GetAIStatus']();
 }
 
 export function OpenDailyReport() {
@@ -54,6 +54,10 @@ export function RunMatchWithAI(arg1) {
   return window['go']['main']['App']['RunMatchWithAI'](arg1);
 }
 
-export function SetDeepseekAPIKey(arg1) {
-  return window['go']['main']['App']['SetDeepseekAPIKey'](arg1);
+export function SetAIConfig(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetAIConfig'](arg1, arg2, arg3);
+}
+
+export function SetAPIKey(arg1) {
+  return window['go']['main']['App']['SetAPIKey'](arg1);
 }
