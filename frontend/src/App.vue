@@ -473,7 +473,7 @@ function scoreClass(score) {
             <input
               type="text"
               v-model="apiEndpoint"
-              placeholder="API 端点 (默认 deepseek)"
+              placeholder="API 端点 (如 http://localhost:8080)"
               class="api-input api-endpoint"
               :disabled="loading"
             />

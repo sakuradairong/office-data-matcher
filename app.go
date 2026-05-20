@@ -1193,9 +1193,12 @@ func (a *App) callAIAPI(messages []deepseekMessage) (string, error) {
 	}
 
 	// 默认值
-	endpoint := a.apiEndpoint
+	endpoint := strings.TrimRight(a.apiEndpoint, "/")
 	if endpoint == "" {
 		endpoint = "https://api.deepseek.com/v1/chat/completions"
+	} else if !strings.HasSuffix(endpoint, "/chat/completions") {
+		// 自动补齐 OpenAI 兼容路径（用户只需填 base URL）
+		endpoint += "/v1/chat/completions"
 	}
 	model := a.apiModel
 	if model == "" {
