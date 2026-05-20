@@ -14,10 +14,6 @@ export function ClearAICache() {
   return window['go']['main']['App']['ClearAICache']();
 }
 
-export function DeepseekEnhanceMatching(arg1, arg2) {
-  return window['go']['main']['App']['DeepseekEnhanceMatching'](arg1, arg2);
-}
-
 export function ExportResults(arg1) {
   return window['go']['main']['App']['ExportResults'](arg1);
 }
@@ -60,8 +56,4 @@ export function RunMatchWithAI(arg1) {
 
 export function SetDeepseekAPIKey(arg1) {
   return window['go']['main']['App']['SetDeepseekAPIKey'](arg1);
-}
-
-export function StartMatching(arg1, arg2) {
-  return window['go']['main']['App']['StartMatching'](arg1, arg2);
 }

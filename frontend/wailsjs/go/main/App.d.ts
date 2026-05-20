@@ -8,11 +8,9 @@ export function CleanString(arg1:string):Promise<string>;
 
 export function ClearAICache():Promise<string>;
 
-export function DeepseekEnhanceMatching(arg1:string,arg2:string):Promise<Array<main.MatchResult>>;
-
 export function ExportResults(arg1:Array<main.MatchResult>):Promise<string>;
 
-export function GetAICacheInfo():Promise<Record<string, any>>;
+export function GetAICacheInfo():Promise<main.AICacheInfo>;
 
 export function GetDeepseekStatus():Promise<boolean>;
 
@@ -31,5 +29,3 @@ export function RunMatch(arg1:main.MatchConfig):Promise<Array<main.MatchResult>>
 export function RunMatchWithAI(arg1:main.MatchConfig):Promise<Array<main.MatchResult>>;
 
 export function SetDeepseekAPIKey(arg1:string):Promise<string>;
-
-export function StartMatching(arg1:string,arg2:string):Promise<Array<main.MatchResult>>;

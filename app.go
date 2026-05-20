@@ -27,20 +27,12 @@ import (
 
 // MatchResult 匹配结果
 type MatchResult struct {
-	// 新字段（通用化）
-	RowAData    []string `json:"rowAData"`    // A 表原始所有列（新）
-	RowBKey     string   `json:"rowBKey"`     // B 表匹配列的值（新）
-	ExtractValue string  `json:"extractValue"` // 从 B 表提取的目标列值（新）
-
-	// 旧字段（向后兼容）
-	MonthlyCellName string `json:"monthlyCellName"`
-	DailyCellID     string `json:"dailyCellId"`
-	InterruptReason string `json:"interruptReason"`
-
-	// 公共字段
-	TimeDiff        string  `json:"timeDiff"`
+	RowAData       []string `json:"rowAData"`    // A 表原始所有列
+	RowBKey        string   `json:"rowBKey"`     // B 表匹配列的值
+	ExtractValue   string   `json:"extractValue"` // 从 B 表提取的目标列值
+	TimeDiff       string   `json:"timeDiff"`
 	SimilarityScore float64 `json:"similarityScore"`
-	AIMatched       bool    `json:"aiMatched"`
+	AIMatched      bool     `json:"aiMatched"`
 }
 
 // ProgressPayload 进度信息
@@ -113,19 +105,30 @@ type AICacheInfo struct {
 	FilePath string `json:"filePath"`
 }
 
-// AICacheEntry 单条缓存记录
+// AICacheEntry 单条缓存记录（批量 prompt → 响应）
 type AICacheEntry struct {
 	PromptHash string `json:"promptHash"`
 	Response   string `json:"response"`
 	CreatedAt  int64  `json:"createdAt"`
 }
 
+// AIRowCacheEntry 单行 AI 匹配缓存（跨批次复用）
+type AIRowCacheEntry struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"` // AI 匹配到的 extractValue
+	CreatedAt int64  `json:"createdAt"`
+}
+
 // AICache AI 响应缓存（持久化到临时文件）
 type AICache struct {
-	Entries  []AICacheEntry `json:"entries"`
-	mu       sync.RWMutex    // 小写，必须保持非导出以兼容 JSON 序列化
-	filePath string
-	maxSize  int // 最大缓存条目数
+	Entries       []AICacheEntry    `json:"entries"`
+	RowEntries    []AIRowCacheEntry `json:"rowEntries"`
+	entriesIdx    map[string]int    // promptHash → index in Entries (O(1) lookup)
+	rowEntriesIdx map[string]int    // key → index in RowEntries (O(1) lookup)
+	mu            sync.RWMutex
+	filePath      string
+	maxSize       int // 批量缓存最大条目数
+	maxRowSize    int // 行级缓存最大条目数
 }
 
 // cacheFileName 缓存文件名
@@ -139,13 +142,26 @@ const (
 	defaultMaxPreview    = 3
 	defaultMaxBNoTime    = 200
 	defaultAIWindowPadH  = 3.0
+	maxPromptBChars      = 80000 // B 表数据在 prompt 中的最大字符数
 )
+// rebuildIndexes 从切片重建索引 map（反序列化或裁剪后调用）
+func (c *AICache) rebuildIndexes() {
+	c.entriesIdx = make(map[string]int, len(c.Entries))
+	for i := range c.Entries {
+		c.entriesIdx[c.Entries[i].PromptHash] = i
+	}
+	c.rowEntriesIdx = make(map[string]int, len(c.RowEntries))
+	for i := range c.RowEntries {
+		c.rowEntriesIdx[c.RowEntries[i].Key] = i
+	}
+}
 
 // newAICache 创建缓存实例并加载已有数据
 func newAICache() *AICache {
 	c := &AICache{
-		filePath: filepath.Join(os.TempDir(), cacheFileName),
-		maxSize:  500,
+		filePath:   filepath.Join(os.TempDir(), cacheFileName),
+		maxSize:    500,
+		maxRowSize: 5000,
 	}
 	c.loadFromFile()
 	return c
@@ -155,11 +171,20 @@ func newAICache() *AICache {
 func (c *AICache) loadFromFile() {
 	data, err := os.ReadFile(c.filePath)
 	if err != nil {
-		return // 文件不存在或无法读取，从空缓存开始
+		// 文件不存在或无法读取，从空缓存开始
+		if !os.IsNotExist(err) {
+			fmt.Printf("[CACHE] 读取缓存文件失败: %v\n", err)
+		}
+		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_ = json.Unmarshal(data, c) // 忽略解析错误，重置为 entries
+	if err := json.Unmarshal(data, c); err != nil {
+		fmt.Printf("[CACHE] 解析缓存文件失败，重置为空: %v\n", err)
+		c.Entries = nil
+		c.RowEntries = nil
+	}
+	c.rebuildIndexes()
 }
 
 // saveToFile 将缓存写入磁盘
@@ -168,19 +193,20 @@ func (c *AICache) saveToFile() {
 	data, err := json.Marshal(c)
 	c.mu.RUnlock()
 	if err != nil {
+		fmt.Printf("[CACHE] 序列化缓存失败: %v\n", err)
 		return
 	}
-	_ = os.WriteFile(c.filePath, data, 0600)
+	if err := os.WriteFile(c.filePath, data, 0600); err != nil {
+		fmt.Printf("[CACHE] 写入缓存文件失败: %v\n", err)
+	}
 }
 
 // get 根据 hash 查找缓存，命中返回响应，否则返回空
 func (c *AICache) get(hash string) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for i := range c.Entries {
-		if c.Entries[i].PromptHash == hash {
-			return c.Entries[i].Response, true
-		}
+	if idx, ok := c.entriesIdx[hash]; ok && idx < len(c.Entries) && c.Entries[idx].PromptHash == hash {
+		return c.Entries[idx].Response, true
 	}
 	return "", false
 }
@@ -191,27 +217,28 @@ func (c *AICache) put(hash, response string) {
 	defer c.mu.Unlock()
 
 	// 去重：如果已存在则覆盖
-	for i := range c.Entries {
-		if c.Entries[i].PromptHash == hash {
-			c.Entries[i].Response = response
-			c.Entries[i].CreatedAt = time.Now().Unix()
-			return
-		}
+	if idx, ok := c.entriesIdx[hash]; ok && idx < len(c.Entries) && c.Entries[idx].PromptHash == hash {
+		c.Entries[idx].Response = response
+		c.Entries[idx].CreatedAt = time.Now().Unix()
+		return
 	}
 
+	// 新增条目
+	idx := len(c.Entries)
 	c.Entries = append(c.Entries, AICacheEntry{
 		PromptHash: hash,
 		Response:   response,
 		CreatedAt:  time.Now().Unix(),
 	})
+	c.entriesIdx[hash] = idx
 
 	// 超过上限则删除最旧的条目
 	if len(c.Entries) > c.maxSize {
-		// 按 CreatedAt 排序保留最新的
 		sort.Slice(c.Entries, func(i, j int) bool {
 			return c.Entries[i].CreatedAt > c.Entries[j].CreatedAt
 		})
 		c.Entries = c.Entries[:c.maxSize]
+		c.rebuildIndexes()
 	}
 }
 
@@ -220,6 +247,9 @@ func (c *AICache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.Entries = nil
+	c.RowEntries = nil
+	c.entriesIdx = nil
+	c.rowEntriesIdx = nil
 	_ = os.Remove(c.filePath)
 }
 
@@ -227,7 +257,66 @@ func (c *AICache) clear() {
 func (c *AICache) stat() (count int, path string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return len(c.Entries), c.filePath
+	return len(c.Entries) + len(c.RowEntries), c.filePath
+}
+
+// rowKey 为单行匹配构建缓存键
+func (a *App) buildRowCacheKey(matchValue, timeStr string, config MatchConfig) string {
+	parts := fmt.Sprintf("%s|%s|%s|%.1f|%s",
+		matchValue, timeStr, config.RegexPattern, config.TimeWindow,
+		filepath.Base(config.FileBPath))
+	h := sha256.Sum256([]byte(parts))
+	return hex.EncodeToString(h[:])
+}
+
+// getRow 查找行级缓存
+func (c *AICache) getRow(key string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if idx, ok := c.rowEntriesIdx[key]; ok && idx < len(c.RowEntries) && c.RowEntries[idx].Key == key {
+		return c.RowEntries[idx].Value, true
+	}
+	return "", false
+}
+
+// putRow 存入行级缓存（线程安全 + 自动裁剪）
+func (c *AICache) putRow(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 去重：更新已存在的条目
+	if idx, ok := c.rowEntriesIdx[key]; ok && idx < len(c.RowEntries) && c.RowEntries[idx].Key == key {
+		c.RowEntries[idx].Value = value
+		c.RowEntries[idx].CreatedAt = time.Now().Unix()
+		return
+	}
+
+	// 新增条目
+	idx := len(c.RowEntries)
+	c.RowEntries = append(c.RowEntries, AIRowCacheEntry{
+		Key:       key,
+		Value:     value,
+		CreatedAt: time.Now().Unix(),
+	})
+	c.rowEntriesIdx[key] = idx
+
+	// 超过上限则删除最旧的条目
+	if len(c.RowEntries) > c.maxRowSize {
+		sort.Slice(c.RowEntries, func(i, j int) bool {
+			return c.RowEntries[i].CreatedAt > c.RowEntries[j].CreatedAt
+		})
+		c.RowEntries = c.RowEntries[:c.maxRowSize]
+		c.rebuildIndexes()
+	}
+}
+
+// matchPrep 匹配准备的中间结果
+type matchPrep struct {
+	dataA, dataB   [][]string
+	reg            *regexp.Regexp
+	timeWindow     float64
+	threshold      float64
+	windowDuration time.Duration
 }
 
 // ---------- App 结构体 ----------
@@ -238,6 +327,7 @@ type App struct {
 	aiCache      *AICache
 
 	// 最近一次匹配的配置和表头（供导出使用）
+	dataMu      sync.RWMutex
 	lastConfig  MatchConfig
 	headersA    []string
 	headersB    []string
@@ -411,9 +501,7 @@ func parseTimeFlexible(timeStr string) (time.Time, error) {
 
 // ---------- Levenshtein 距离算法 ----------
 
-func levenshteinDistance(s1, s2 string) int {
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+func levenshteinDistance(runes1, runes2 []rune) int {
 	m, n := len(runes1), len(runes2)
 
 	// 使用一维数组优化空间复杂度
@@ -438,12 +526,6 @@ func levenshteinDistance(s1, s2 string) int {
 	return dp[n]
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 // CalculateSimilarity 计算清洗后中文名称的相似度（基于 Levenshtein 距离归一化）
 func (a *App) CalculateSimilarity(s1, s2 string) float64 {
@@ -473,7 +555,7 @@ func calcSimilarity(s1, s2 string, reg *regexp.Regexp, caseSensitive bool) float
 		return 0.0
 	}
 
-	dist := levenshteinDistance(clean1, clean2)
+	dist := levenshteinDistance(r1, r2)
 	maxLen := math.Max(float64(len(r1)), float64(len(r2)))
 	return 1.0 - float64(dist)/maxLen
 }
@@ -484,6 +566,24 @@ func cleanWithRegex(input string, reg *regexp.Regexp) string {
 		return input
 	}
 	return reg.ReplaceAllString(input, "")
+}
+// similarityFromCleaned 基于已清洗字符串计算相似度（跳过 regex 步骤，避免重复清洗）
+func similarityFromCleaned(clean1, clean2 string, caseSensitive bool) float64 {
+	if !caseSensitive {
+		clean1 = strings.ToLower(clean1)
+		clean2 = strings.ToLower(clean2)
+	}
+	r1 := []rune(clean1)
+	r2 := []rune(clean2)
+	if len(r1) == 0 && len(r2) == 0 {
+		return 1.0
+	}
+	if len(r1) == 0 || len(r2) == 0 {
+		return 0.0
+	}
+	dist := levenshteinDistance(r1, r2)
+	maxLen := math.Max(float64(len(r1)), float64(len(r2)))
+	return 1.0 - float64(dist)/maxLen
 }
 
 // ---------- 文件读取（通用）----------
@@ -551,25 +651,22 @@ func getCell(row []string, idx int) string {
 }
 
 
-// RunMatch 接收完整 MatchConfig，按列索引执行通用匹配
-func (a *App) RunMatch(config MatchConfig) ([]MatchResult, error) {
-	// 1. 编译正则
+// prepareMatch 编译正则、读取文件、初始化默认值（RunMatch / RunMatchWithAI 共用）
+func (a *App) prepareMatch(config MatchConfig) (*matchPrep, error) {
 	reg, err := compileRegex(config.RegexPattern)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. 默认值兜底
-	timeWindow := config.TimeWindow
-	if timeWindow <= 0 {
-		timeWindow = defaultTimeWindowH
+	tw := config.TimeWindow
+	if tw <= 0 {
+		tw = defaultTimeWindowH
 	}
-	threshold := config.Threshold
-	if threshold <= 0 {
-		threshold = defaultThreshold
+	th := config.Threshold
+	if th <= 0 {
+		th = defaultThreshold
 	}
 
-	// 3. 读取原始数据
 	a.emitProgress(0, 100, "正在读取 A 表...", "reading")
 	rowsA, err := a.readRawRows(config.FileAPath)
 	if err != nil {
@@ -587,22 +684,35 @@ func (a *App) RunMatch(config MatchConfig) ([]MatchResult, error) {
 		return nil, fmt.Errorf("B 表无有效数据行")
 	}
 
-	// 保存表头供导出使用
+	a.dataMu.Lock()
 	a.headersA = rowsA[0]
 	a.headersB = rowsB[0]
 	a.lastConfig = config
+	a.dataMu.Unlock()
 
-	dataA := rowsA[1:]
-	dataB := rowsB[1:]
-	windowDuration := time.Duration(timeWindow * float64(time.Hour))
-
-	return a.runMatchOnData(dataA, dataB, reg, config, timeWindow, threshold, windowDuration)
+	return &matchPrep{
+		dataA:          rowsA[1:],
+		dataB:          rowsB[1:],
+		reg:            reg,
+		timeWindow:     tw,
+		threshold:      th,
+		windowDuration: time.Duration(tw * float64(time.Hour)),
+	}, nil
 }
 
-// runMatchOnData 在已读取的数据上执行匹配（内部使用，避免重复 I/O）
-func (a *App) runMatchOnData(dataA, dataB [][]string, reg *regexp.Regexp, config MatchConfig, _, threshold float64, windowDuration time.Duration) ([]MatchResult, error) {
+// RunMatch 接收完整 MatchConfig，按列索引执行通用匹配
+func (a *App) RunMatch(config MatchConfig) ([]MatchResult, error) {
+	prep, err := a.prepareMatch(config)
+	if err != nil {
+		return nil, err
+	}
+	return a.runMatchOnData(prep, config)
+}
+
+// runMatchOnData 在已读取的数据上执行匹配
+func (a *App) runMatchOnData(prep *matchPrep, config MatchConfig) ([]MatchResult, error) {
 	useTime := config.ColATimeIndex >= 0 && config.ColBTimeIndex >= 0
-	totalA := len(dataA)
+	totalA := len(prep.dataA)
 	var results []MatchResult
 
 	useAllMatches := config.AllMatches
@@ -611,7 +721,40 @@ func (a *App) runMatchOnData(dataA, dataB [][]string, reg *regexp.Regexp, config
 		maxPreview = defaultMaxPreview
 	}
 
-	for i, rowA := range dataA {
+	// 预计算 B 表清洗后的匹配值，避免内层循环中重复 regex 替换（O(n*m)→O(n+m)）
+	totalB := len(prep.dataB)
+	cleanedBMatch := make([]string, totalB)
+	origBMatch := make([]string, totalB)
+	parsedBTime := make([]time.Time, totalB)
+	hasBTime := make([]bool, totalB)
+	bExtractVal := make([]string, totalB)
+	for bIdx, rowB := range prep.dataB {
+		matchStrB := getCell(rowB, config.ColBMatchIndex)
+		origBMatch[bIdx] = matchStrB
+		if matchStrB == "" {
+			cleanedBMatch[bIdx] = ""
+		} else {
+			cleanedBMatch[bIdx] = cleanWithRegex(matchStrB, prep.reg)
+		}
+		if useTime {
+			t, err := parseTimeFlexible(getCell(rowB, config.ColBTimeIndex))
+			if err == nil {
+				parsedBTime[bIdx] = t
+				hasBTime[bIdx] = true
+			}
+		}
+		bExtractVal[bIdx] = getCell(rowB, config.ColBExtractIndex)
+	}
+	for i, rowA := range prep.dataA {
+		// 定期检查是否取消
+		if a.ctx != nil {
+			select {
+			case <-a.ctx.Done():
+				return results, a.ctx.Err()
+			default:
+			}
+		}
+
 		if i%10 == 0 || i == totalA-1 {
 			pct := (i + 1) * 100 / totalA
 			a.emitProgress(i+1, totalA,
@@ -633,46 +776,46 @@ func (a *App) runMatchOnData(dataA, dataB [][]string, reg *regexp.Regexp, config
 			}
 		}
 
-		cleanA := cleanWithRegex(matchStrA, reg)
+		cleanA := cleanWithRegex(matchStrA, prep.reg)
 		// 收集该 A 行的所有候选匹配
 		var candidates []MatchResult
 
-		for _, rowB := range dataB {
-			matchStrB := getCell(rowB, config.ColBMatchIndex)
-			if matchStrB == "" {
-				continue
-			}
+	for bIdx := range prep.dataB {
+		matchStrB := origBMatch[bIdx]
+		if matchStrB == "" {
+			continue
+		}
 
-			var timeDiff time.Duration
-			if hasTimeA && useTime {
-				tB, err := parseTimeFlexible(getCell(rowB, config.ColBTimeIndex))
-				if err != nil {
-					continue
-				}
-				td := timeA.Sub(tB)
-				if td < -windowDuration || td > windowDuration {
-					continue
-				}
-				timeDiff = td
-			}
+		var timeDiff time.Duration
+	if hasTimeA && useTime {
+		if !hasBTime[bIdx] {
+			continue
+		}
+		tB := parsedBTime[bIdx]
+		td := timeA.Sub(tB)
+		if td < -prep.windowDuration || td > prep.windowDuration {
+			continue
+		}
+		timeDiff = td
+	}
 
-			cleanB := cleanWithRegex(matchStrB, reg)
-			if cleanA == "" || cleanB == "" {
-				continue
-			}
+		cleanB := cleanedBMatch[bIdx]
+		if cleanA == "" || cleanB == "" {
+			continue
+		}
 
-			similarity := calcSimilarity(matchStrA, matchStrB, reg, config.CaseSensitive)
+		similarity := similarityFromCleaned(cleanA, cleanB, config.CaseSensitive)
 
 			if i < maxPreview {
 				fmt.Printf("[DEBUG] | A[%d]='%s'→'%s' | B='%s'→'%s' | 相似度=%.4f\n",
 					i, matchStrA, cleanA, matchStrB, cleanB, similarity)
 			}
 
-			if similarity >= threshold {
+			if similarity >= prep.threshold {
 				mr := MatchResult{
 					RowAData:        rowA,
 					RowBKey:         matchStrB,
-					ExtractValue:    getCell(rowB, config.ColBExtractIndex),
+				ExtractValue:    bExtractVal[bIdx],
 					TimeDiff:        formatTimeDiff(timeDiff),
 					SimilarityScore: math.Round(similarity*10000) / 10000,
 					AIMatched:       false,
@@ -757,60 +900,25 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 		return nil, fmt.Errorf("请先设置 Deepseek API 密钥")
 	}
 
-	// 1. 编译正则
-	reg, err := compileRegex(config.RegexPattern)
+	prep, err := a.prepareMatch(config)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. 默认值兜底
-	timeWindow := config.TimeWindow
-	if timeWindow <= 0 {
-		timeWindow = defaultTimeWindowH
-	}
-	threshold := config.Threshold
-	if threshold <= 0 {
-		threshold = defaultThreshold
-	}
-	windowDuration := time.Duration(timeWindow * float64(time.Hour))
-
-	// 3. 一次读取数据，供匹配和 AI 使用
-	a.emitProgress(0, 100, "正在读取 A 表...", "reading")
-	rowsA, err := a.readRawRows(config.FileAPath)
-	if err != nil {
-		return nil, fmt.Errorf("读取 A 表失败: %v", err)
-	}
-	a.emitProgress(0, 100, "正在读取 B 表...", "reading")
-	rowsB, err := a.readRawRows(config.FileBPath)
-	if err != nil {
-		return nil, fmt.Errorf("读取 B 表失败: %v", err)
-	}
-	if len(rowsA) < 2 || len(rowsB) < 2 {
-		return nil, fmt.Errorf("数据表无有效数据行")
-	}
-
-	// 保存表头供导出使用
-	a.headersA = rowsA[0]
-	a.headersB = rowsB[0]
-	a.lastConfig = config
-
-	dataA := rowsA[1:]
-	dataB := rowsB[1:]
-
-	// 4. 先执行基础匹配（使用已读取的数据，避免重复 I/O）
-	results, err := a.runMatchOnData(dataA, dataB, reg, config, timeWindow, threshold, windowDuration)
+	// 1. 先执行基础匹配
+	results, err := a.runMatchOnData(prep, config)
 	if err != nil {
 		return nil, err
 	}
 
-	// 5. 找出未被基础匹配覆盖的 A 表行
+	// 2. 找出未被基础匹配覆盖的 A 表行
 	matchedSet := make(map[string]bool)
 	for _, r := range results {
 		matchedSet[strings.Join(r.RowAData, "\x00")] = true
 	}
 
 	var unmatchedA [][]string
-	for _, row := range dataA {
+	for _, row := range prep.dataA {
 		if !matchedSet[strings.Join(row, "\x00")] {
 			unmatchedA = append(unmatchedA, row)
 		}
@@ -821,26 +929,61 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 		return results, nil
 	}
 
-	// 6. AI 增强匹配
+	// 3. AI 增强匹配（先查行级缓存，减少 API 调用）
 	useTime := config.ColATimeIndex >= 0 && config.ColBTimeIndex >= 0
-	totalUnmatched := len(unmatchedA)
-	a.emitProgress(0, totalUnmatched,
-		fmt.Sprintf("AI 增强匹配：还有 %d 条未匹配记录，正在调用 Deepseek...", totalUnmatched),
-		"ai-enhancing")
 
 	aiMatched := 0
+	var failedBatches []int
+
+	// 3a. 检查行级缓存，命中则直接加入结果
+	var uncachedA [][]string
+	cacheHits := 0
+	for _, row := range unmatchedA {
+		matchVal := getCell(row, config.ColAMatchIndex)
+		timeStr := ""
+		if useTime {
+			timeStr = getCell(row, config.ColATimeIndex)
+		}
+		cacheKey := a.buildRowCacheKey(matchVal, timeStr, config)
+		if cachedVal, ok := a.aiCache.getRow(cacheKey); ok {
+			results = append(results, MatchResult{
+				RowAData:        row,
+				RowBKey:         "",
+				ExtractValue:    cachedVal,
+				SimilarityScore: 0,
+				AIMatched:       true,
+			})
+			aiMatched++
+			cacheHits++
+		} else {
+			uncachedA = append(uncachedA, row)
+		}
+	}
+
+	if cacheHits > 0 {
+		fmt.Printf("[CACHE] ✓ 行级缓存命中 %d 条，剩余 %d 条需 AI 处理\n", cacheHits, len(uncachedA))
+	}
+
+	if len(uncachedA) == 0 {
+		a.emitProgress(1, 1,
+			fmt.Sprintf("AI 增强完成！全部 %d 条命中缓存", cacheHits), "done")
+		return results, nil
+	}
+
+	totalUnmatched := len(uncachedA)
+	a.emitProgress(0, totalUnmatched,
+		fmt.Sprintf("AI 增强匹配：%d 条命中缓存，%d 条需调用 Deepseek...", cacheHits, totalUnmatched),
+		"ai-enhancing")
 
 	for batchStart := 0; batchStart < totalUnmatched; batchStart += defaultBatchSize {
-		end := batchStart + defaultBatchSize
-		if end > totalUnmatched {
-			end = totalUnmatched
-		}
+		end := min(batchStart+defaultBatchSize, totalUnmatched)
+		batchNum := (batchStart / defaultBatchSize) + 1
 
 		a.emitProgress(batchStart+1, totalUnmatched,
-			fmt.Sprintf("AI 分析中 %d/%d (第 %d 批)...", end, totalUnmatched, (batchStart/defaultBatchSize)+1),
+			fmt.Sprintf("AI 分析中 %d/%d (第 %d 批)...", end, totalUnmatched, batchNum),
 			"ai-enhancing")
 
-		batch := unmatchedA[batchStart:end]
+		batch := uncachedA[batchStart:end]
 
 		// 计算本批 A 表的时间范围
 		var minTime, maxTime time.Time
@@ -868,10 +1011,10 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 		// 过滤 B 表在时间窗口内的行（用户配置时间窗口 + 额外余量覆盖批次跨度）
 		var relevantB [][]string
 		if hasBatchTime && useTime {
-			padding := windowDuration + time.Duration(defaultAIWindowPadH)*time.Hour
+			padding := prep.windowDuration + time.Duration(defaultAIWindowPadH)*time.Hour
 			ws := minTime.Add(-padding)
 			we := maxTime.Add(padding)
-			for _, row := range dataB {
+			for _, row := range prep.dataB {
 				t, err := parseTimeFlexible(getCell(row, config.ColBTimeIndex))
 				if err != nil || t.Before(ws) || t.After(we) {
 					continue
@@ -880,17 +1023,16 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 			}
 		} else {
 			// 无时间列时限制 B 表条数以控制 token 消耗
-			maxB := defaultMaxBNoTime
-			if len(dataB) < maxB {
-				maxB = len(dataB)
-			}
-			relevantB = dataB[:maxB]
+			maxB := min(defaultMaxBNoTime, len(prep.dataB))
+			relevantB = prep.dataB[:maxB]
 		}
 
 		// 构建 AI 提示
-		prompt := a.buildGenericAIPrompt(batch, relevantB, config, windowDuration, hasBatchTime)
+		prompt := a.buildGenericAIPrompt(batch, relevantB, config, prep.windowDuration, hasBatchTime)
 		aiResp, err := a.callDeepseekAPI(prompt)
 		if err != nil {
+			fmt.Printf("[AI-WARN] 第 %d 批 API 调用失败: %v\n", batchNum, err)
+			failedBatches = append(failedBatches, batchNum)
 			continue
 		}
 
@@ -911,7 +1053,8 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 		}
 		if parseErr != nil {
 			fmt.Printf("[AI-WARN] 响应解析失败 (第 %d 批): %s\n   原始响应: %.200s\n",
-				(batchStart/defaultBatchSize)+1, parseErr.Error(), aiResp)
+				batchNum, parseErr.Error(), aiResp)
+			failedBatches = append(failedBatches, batchNum)
 			continue
 		}
 
@@ -930,13 +1073,27 @@ func (a *App) RunMatchWithAI(config MatchConfig) ([]MatchResult, error) {
 				AIMatched:       true,
 			}
 			results = append(results, mr)
-			aiMatched++
+				aiMatched++
+
+				// 写入行级缓存
+				matchVal := getCell(rowA, config.ColAMatchIndex)
+				timeStr := ""
+				if useTime {
+					timeStr = getCell(rowA, config.ColATimeIndex)
+				}
+				cacheKey := a.buildRowCacheKey(matchVal, timeStr, config)
+				a.aiCache.putRow(cacheKey, val)
 		}
 	}
+	a.aiCache.saveToFile()
 
-	a.emitProgress(totalUnmatched, totalUnmatched,
-		fmt.Sprintf("AI 增强完成！基础匹配 %d 条 + AI 补充 %d 条 = 共 %d 条",
-			len(results)-aiMatched, aiMatched, len(results)), "done")
+	// 构建完成消息
+	msg := fmt.Sprintf("AI 增强完成！基础匹配 %d 条 + AI 补充 %d 条 = 共 %d 条",
+		len(results)-aiMatched, aiMatched, len(results))
+	if len(failedBatches) > 0 {
+		msg += fmt.Sprintf("（警告：第 %v 批失败）", failedBatches)
+	}
+	a.emitProgress(totalUnmatched, totalUnmatched, msg, "done")
 
 	return results, nil
 }
@@ -967,7 +1124,8 @@ func (a *App) buildGenericAIPrompt(unmatched, bRows [][]string, config MatchConf
 	}
 
 	sb.WriteString(fmt.Sprintf("\nB 表参考数据（共 %d 条）：\n", len(bRows)))
-	for _, row := range bRows {
+	truncated := false
+	for i, row := range bRows {
 		matchVal := getCell(row, config.ColBMatchIndex)
 		extractVal := getCell(row, config.ColBExtractIndex)
 		sb.WriteString(fmt.Sprintf("  「%s」 → 目标列值: 「%s」", matchVal, extractVal))
@@ -975,6 +1133,15 @@ func (a *App) buildGenericAIPrompt(unmatched, bRows [][]string, config MatchConf
 			sb.WriteString(fmt.Sprintf(", 时间=%s", getCell(row, config.ColBTimeIndex)))
 		}
 		sb.WriteString("\n")
+		// 限制 B 表部分总字符数，防止 prompt 超出 token 限制
+		if sb.Len() > maxPromptBChars {
+			fmt.Printf("[AI-WARN] Prompt B 表数据超长 (%d 条，%d 字符)，截断于第 %d 条\n", len(bRows), sb.Len(), i)
+			truncated = true
+		}
+		if truncated {
+			sb.WriteString(fmt.Sprintf("  ... 已截断，省略 %d 条\n", len(bRows)-i-1))
+			break
+		}
 	}
 
 	sb.WriteString("\n请返回 JSON 格式的匹配结果。")
@@ -1037,7 +1204,10 @@ func (a *App) callDeepseekAPI(messages []deepseekMessage) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	respBytes, _ := io.ReadAll(resp.Body)
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取 Deepseek 响应失败: %v", err)
+	}
 	var dr deepseekResponse
 	if err := json.Unmarshal(respBytes, &dr); err != nil {
 		return "", fmt.Errorf("解析 Deepseek 响应失败: %v", err)
@@ -1091,7 +1261,12 @@ func (a *App) ExportResults(results []MatchResult) (string, error) {
 		return "", fmt.Errorf("没有匹配结果可以导出")
 	}
 
-	isCSV := a.lastConfig.ExportFormat == "csv"
+	a.dataMu.RLock()
+	useCSV := a.lastConfig.ExportFormat == "csv"
+	includeHdr := a.lastConfig.IncludeHeader
+	a.dataMu.RUnlock()
+
+	isCSV := useCSV
 	ext := ".xlsx"
 	filterDisplay := "Excel 文件 (*.xlsx)"
 	filterPattern := "*.xlsx"
@@ -1119,16 +1294,21 @@ func (a *App) ExportResults(results []MatchResult) (string, error) {
 	}
 
 	if isCSV {
-		return a.exportResultsCSV(results, savePath)
+		return a.exportResultsCSV(results, savePath, includeHdr)
 	}
-	return a.exportResultsXLSX(results, savePath)
+	return a.exportResultsXLSX(results, savePath, includeHdr)
 }
 
 // exportHeaders 构建导出表头行（使用真实表头或回退默认）
 func (a *App) exportHeaders(numACols int) []string {
+	a.dataMu.RLock()
+	hdrA := make([]string, len(a.headersA))
+	copy(hdrA, a.headersA)
+	a.dataMu.RUnlock()
+
 	headers := make([]string, 0, numACols+1)
-	if len(a.headersA) >= numACols {
-		for _, h := range a.headersA[:numACols] {
+	if len(hdrA) >= numACols {
+		for _, h := range hdrA[:numACols] {
 			n := h
 			if n == "" {
 				n = fmt.Sprintf("Col%d", len(headers)+1)
@@ -1144,7 +1324,7 @@ func (a *App) exportHeaders(numACols int) []string {
 	return headers
 }
 
-func (a *App) exportResultsXLSX(results []MatchResult, savePath string) (string, error) {
+func (a *App) exportResultsXLSX(results []MatchResult, savePath string, includeHeader bool) (string, error) {
 	f := excelize.NewFile()
 	defer f.Close()
 	sheetName := "匹配结果"
@@ -1157,7 +1337,7 @@ func (a *App) exportResultsXLSX(results []MatchResult, savePath string) (string,
 	extractCol := numACols
 
 	// 表头
-	if a.lastConfig.IncludeHeader {
+	if includeHeader {
 		for i, h := range headers {
 			f.SetCellValue(sheetName, fmt.Sprintf("%s1", colLetter(i)), h)
 		}
@@ -1166,12 +1346,41 @@ func (a *App) exportResultsXLSX(results []MatchResult, savePath string) (string,
 			Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"4472C4"}},
 		})
 		f.SetCellStyle(sheetName, "A1", fmt.Sprintf("%s1", colLetter(extractCol)), headerStyle)
+		// 数据行样式（带边框和行号字体）
+		dataStyle, _ := f.NewStyle(&excelize.Style{
+			Font: &excelize.Font{Size: 11},
+			Border: []excelize.Border{
+				{Type: "bottom", Color: "D9D9D9", Style: 1},
+			},
+		})
+		firstDataRow := 2
+		lastDataRow := len(results) + 1
+		for ci := 0; ci <= numACols; ci++ {
+			f.SetCellStyle(sheetName,
+				fmt.Sprintf("%s%d", colLetter(ci), firstDataRow),
+				fmt.Sprintf("%s%d", colLetter(ci), lastDataRow),
+				dataStyle)
+		}
+	} else {
+		dataStyle, _ := f.NewStyle(&excelize.Style{
+			Font: &excelize.Font{Size: 11},
+			Border: []excelize.Border{
+				{Type: "bottom", Color: "D9D9D9", Style: 1},
+			},
+		})
+		lastDataRow := len(results)
+		for ci := 0; ci <= numACols; ci++ {
+			f.SetCellStyle(sheetName,
+				fmt.Sprintf("%s%d", colLetter(ci), 1),
+				fmt.Sprintf("%s%d", colLetter(ci), lastDataRow),
+				dataStyle)
+		}
 	}
 
 	// 数据行
 	for i, r := range results {
 		rowNum := i + 2
-		if !a.lastConfig.IncludeHeader {
+		if !includeHeader {
 			rowNum = i + 1
 		}
 		for ci := 0; ci < numACols; ci++ {
@@ -1191,7 +1400,7 @@ func (a *App) exportResultsXLSX(results []MatchResult, savePath string) (string,
 	return savePath, nil
 }
 
-func (a *App) exportResultsCSV(results []MatchResult, savePath string) (string, error) {
+func (a *App) exportResultsCSV(results []MatchResult, savePath string, includeHeader bool) (string, error) {
 	var buf bytes.Buffer
 	// 使用 UTF-8 BOM 帮助 Excel 正确识别编码
 	buf.Write([]byte{0xEF, 0xBB, 0xBF})
@@ -1200,7 +1409,7 @@ func (a *App) exportResultsCSV(results []MatchResult, savePath string) (string, 
 	headers := a.exportHeaders(numACols)
 
 	// 表头行
-	if a.lastConfig.IncludeHeader {
+	if includeHeader {
 		for i, h := range headers {
 			if i > 0 {
 				buf.WriteByte(',')

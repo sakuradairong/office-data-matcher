@@ -1,5 +1,19 @@
 export namespace main {
 	
+	export class AICacheInfo {
+	    count: number;
+	    filePath: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new AICacheInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.count = source["count"];
+	        this.filePath = source["filePath"];
+	    }
+	}
 	export class MatchConfig {
 	    fileAPath: string;
 	    fileBPath: string;
@@ -46,9 +60,6 @@ export namespace main {
 	    rowAData: string[];
 	    rowBKey: string;
 	    extractValue: string;
-	    monthlyCellName: string;
-	    dailyCellId: string;
-	    interruptReason: string;
 	    timeDiff: string;
 	    similarityScore: number;
 	    aiMatched: boolean;
@@ -62,9 +73,6 @@ export namespace main {
 	        this.rowAData = source["rowAData"];
 	        this.rowBKey = source["rowBKey"];
 	        this.extractValue = source["extractValue"];
-	        this.monthlyCellName = source["monthlyCellName"];
-	        this.dailyCellId = source["dailyCellId"];
-	        this.interruptReason = source["interruptReason"];
 	        this.timeDiff = source["timeDiff"];
 	        this.similarityScore = source["similarityScore"];
 	        this.aiMatched = source["aiMatched"];
